@@ -1,0 +1,94 @@
+from functools import lru_cache
+
+from pydantic_settings import (
+    BaseSettings,
+    SettingsConfigDict,
+)
+
+
+class Settings(BaseSettings):
+    app_name: str = (
+        "Parser Management System"
+    )
+
+    app_version: str = "0.10.0"
+    environment: str = "development"
+    log_level: str = "INFO"
+
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+
+    database_url: str = (
+        "sqlite:///./parser_management.db"
+    )
+
+    upload_directory: str = "data/uploads"
+    output_directory: str = "data/outputs"
+
+    max_file_size_mb: int = 25
+    max_sheets: int = 25
+    max_rows_per_sheet: int = 100_000
+    max_columns_per_sheet: int = 500
+
+    maximum_header_scan_rows: int = 20
+    maximum_type_sample_rows: int = 50
+    maximum_merged_ranges_per_sheet: int = 100
+    maximum_formula_samples_per_sheet: int = 20
+
+    fingerprint_version: str = "1.0"
+
+    parser_match_policy: str = (
+        "EXACT_APPROVED_FINGERPRINT_ONLY"
+    )
+
+    maximum_parser_output_rows: int = 1_000
+    maximum_parser_mappings: int = 200
+
+    maximum_duplicate_samples: int = 20
+    maximum_validation_issue_samples: int = 50
+
+    # Part 10 Vertex AI settings.
+    enable_llm_proposal: bool = True
+
+    google_cloud_project: str = (
+        "deutschebank-aipocs"
+    )
+
+    google_cloud_location: str = (
+        "us-central1"
+    )
+
+    vertex_model_name: str = (
+        "gemini-2.5-flash"
+    )
+
+    vertex_proposal_temperature: float = 0.0
+    vertex_proposal_max_output_tokens: int = 4096
+
+    vertex_proposal_thinking_budget: int = 256
+    vertex_proposal_max_attempts: int = 3
+    vertex_proposal_retry_delay_seconds: float = 1.0
+
+    # If Vertex AI fails, generate the safe
+    # deterministic proposal instead.
+    enable_deterministic_proposal_fallback: bool = (
+        True
+    )
+
+    api_base_url: str = (
+        "http://127.0.0.1:8000"
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

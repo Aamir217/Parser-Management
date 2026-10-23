@@ -1,0 +1,1115 @@
+import os
+
+import requests
+import streamlit as st
+
+from frontend.node_timeline import (
+    render_node_timeline,
+)
+
+from frontend.node_metadata import (
+    build_node_button_label,
+)
+
+from frontend.node_inspector import (
+    find_execution_by_id,
+    render_node_inspector,
+)
+
+from frontend.node_metadata import (
+    get_node_badge,
+    get_node_label,
+    get_node_metadata,
+    is_llm_node,
+)
+
+
+API_BASE_URL = os.getenv(
+    "API_BASE_URL",
+    "http://127.0.0.1:8000",
+)
+
+
+STATUS_ICONS = {
+    "PASSED": "✅",
+    "RUNNING": "🔄",
+    "WAITING": "⏸️",
+    "BLOCKED": "⛔",
+    "FAILED": "❌",
+}
+
+
+st.set_page_config(
+    page_title="Parser Management",
+    page_icon="📄",
+    layout="wide",
+)
+
+
+if "run_id" not in st.session_state:
+    st.session_state.run_id = None
+
+
+if "selected_execution_id" not in st.session_state:
+    st.session_state.selected_execution_id = None
+
+
+if "upload_error" not in st.session_state:
+    st.session_state.upload_error = None
+
+
+if "reviewer_id" not in st.session_state:
+    st.session_state.reviewer_id = (
+        "meeting-reviewer"
+    )
+
+
+if "review_comments" not in st.session_state:
+    st.session_state.review_comments = ""
+
+
+st.title("Parser Management System")
+
+st.caption(
+    "Deterministic Excel guardrails, live file "
+    "status, and node-level state inspection"
+)
+
+
+with st.sidebar:
+    st.subheader("System status")
+
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/health/ready",
+            timeout=5,
+        )
+
+        response.raise_for_status()
+
+        readiness = response.json()
+
+        if readiness["status"] == "ready":
+            st.success("Backend is ready")
+        else:
+            st.warning("Backend is not ready")
+
+        st.json(readiness)
+
+    except requests.RequestException as exception:
+        st.error("Backend is unavailable")
+        st.code(str(exception))
+
+
+st.subheader("Upload an Excel workbook")
+
+uploaded_file = st.file_uploader(
+    "Select an .xlsx file",
+    type=["xlsx"],
+    accept_multiple_files=False,
+)
+
+
+if st.button(
+    "Validate and store file",
+    type="primary",
+    disabled=uploaded_file is None,
+):
+    st.session_state.upload_error = None
+
+    st.session_state[
+        "selected_execution_id"
+    ] = None
+
+    try:
+        with st.status(
+            (
+                "Applying deterministic "
+                "upload guardrails..."
+            ),
+            expanded=True,
+        ) as upload_status:
+            st.write(
+                "Sending the workbook to FastAPI"
+            )
+
+            st.write(
+                "Validating file identity, size, "
+                "XLSX structure, and checksum"
+            )
+
+            response = requests.post(
+                f"{API_BASE_URL}/v1/uploads",
+                files={
+                    "uploaded_file": (
+                        uploaded_file.name,
+                        uploaded_file.getvalue(),
+                        (
+                            uploaded_file.type
+                            or (
+                                "application/vnd."
+                                "openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        ),
+                    )
+                },
+                timeout=60,
+            )
+
+            response_body = response.json()
+
+            if response.status_code != 201:
+                detail = response_body.get(
+                    "detail",
+                    response_body,
+                )
+
+                st.session_state.upload_error = (
+                    detail
+                )
+
+                # Keep the failed run so the user
+                # can inspect its blocked node.
+                if isinstance(detail, dict):
+                    failed_run_id = detail.get(
+                        "run_id"
+                    )
+
+                    if failed_run_id:
+                        st.session_state.run_id = (
+                            failed_run_id
+                        )
+
+                upload_status.update(
+                    label="File was blocked",
+                    state="error",
+                )
+
+            else:
+                st.session_state.run_id = (
+                    response_body["run_id"]
+                )
+
+                st.write(
+                    "Original workbook stored "
+                    "successfully"
+                )
+
+                upload_status.update(
+                    label=(
+                        "File validation and "
+                        "storage completed"
+                    ),
+                    state="complete",
+                )
+
+    except requests.RequestException as exception:
+        st.session_state.upload_error = {
+            "status": "REQUEST_FAILED",
+            "message": str(exception),
+        }
+
+
+if st.session_state.upload_error:
+    st.error("The upload was blocked")
+
+    st.json(
+        st.session_state.upload_error
+    )
+
+
+@st.fragment(run_every="1s")
+def render_run_status() -> None:
+    run_id = st.session_state.run_id
+
+    if not run_id:
+        st.info(
+            "Upload an Excel workbook to "
+            "start the file workflow."
+        )
+
+        return
+
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/v1/runs/{run_id}",
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        run = response.json()
+
+    except requests.RequestException as exception:
+        st.error(
+            "Could not retrieve workflow status."
+        )
+
+        st.code(str(exception))
+
+        return
+
+    st.divider()
+
+    st.subheader(
+        f"File status: {run['filename']}"
+    )
+
+    metric_columns = st.columns(4)
+
+    metric_columns[0].metric(
+        "Status",
+        run["status"],
+    )
+
+    metric_columns[1].metric(
+        "Current node",
+        run["current_node"],
+    )
+
+    metric_columns[2].metric(
+        "Progress",
+        f"{run['progress_percent']}%",
+    )
+
+    file_id = run.get("file_id")
+
+    metric_columns[3].metric(
+        "File ID",
+        (
+            file_id[:8]
+            if file_id
+            else "Not assigned"
+        ),
+    )
+
+    progress_value = max(
+        0,
+        min(
+            run["progress_percent"] / 100,
+            1.0,
+        ),
+    )
+
+    st.progress(
+        progress_value,
+        text=(
+            f"{run['progress_percent']}% complete"
+        ),
+    )
+
+    if run["status"] in {
+        "UPLOAD_COMPLETED",
+        "INSPECTION_COMPLETED",
+        "FINGERPRINT_COMPLETED",
+        "APPROVED_PARSER_FOUND",
+        "NO_APPROVED_PARSER_FOUND",
+        "PARSING_COMPLETED",
+        "PROPOSAL_PENDING_REVIEW",
+        "WORKFLOW_COMPLETED",
+        "WORKFLOW_COMPLETED_WITH_WARNINGS",
+        "FINAL_FILE_READY",
+    }:
+        st.success(
+            "The workbook passed upload guardrails, "
+            "was stored, inspected, fingerprinted, "
+            "and checked against the approved "
+            "parser registry."
+        )
+
+    elif run["status"] == "BLOCKED":
+        st.error(
+            run["error_message"]
+            or (
+                "The file was blocked by "
+                "a deterministic guardrail."
+            )
+        )
+
+    elif run["status"] == "FAILED":
+        st.error(
+            run["error_message"]
+            or "The workflow failed."
+        )
+
+    else:
+        st.info(
+            f"Current activity: "
+            f"{run['current_node']}"
+        )
+
+    if run["status"] == "PARSING_COMPLETED":
+        st.markdown("### Parsed output")
+
+        st.success(
+            "The approved declarative parser "
+            "completed successfully."
+        )
+
+        latest_execution_output = None
+
+        for execution in reversed(
+            run.get(
+                "node_executions",
+                [],
+            )
+        ):
+            if (
+                execution["node_name"]
+                == "execute_approved_parser"
+            ):
+                latest_execution_output = (
+                    execution["output_state"]
+                )
+                break
+
+        if latest_execution_output:
+            summary_columns = st.columns(4)
+
+            summary_columns[0].metric(
+                "Source rows",
+                latest_execution_output.get(
+                    "source_row_count",
+                    0,
+                ),
+            )
+
+            summary_columns[1].metric(
+                "Parsed rows",
+                latest_execution_output.get(
+                    "parsed_row_count",
+                    0,
+                ),
+            )
+
+            summary_columns[2].metric(
+                "Rejected rows",
+                latest_execution_output.get(
+                    "rejected_row_count",
+                    0,
+                ),
+            )
+
+            summary_columns[3].metric(
+                "Output truncated",
+                str(
+                    latest_execution_output.get(
+                        "output_truncated",
+                        False,
+                    )
+                ),
+            )
+
+            parsed_records = (
+                latest_execution_output.get(
+                    "parsed_records",
+                    [],
+                )
+            )
+
+            if parsed_records:
+                st.dataframe(
+                    parsed_records,
+                    use_container_width=True,
+                )
+            else:
+                st.info(
+                    "The parser produced no rows."
+                )
+
+    if (
+        run["status"]
+        == "PROPOSAL_PENDING_REVIEW"
+    ):
+        st.markdown(
+            "### Parser proposal"
+        )
+
+        st.warning(
+            "The format is unknown. A parser "
+            "proposal was generated, but no "
+            "parser is executing. Human review "
+            "is required."
+        )
+
+        proposal_output = None
+
+        for execution in reversed(
+            run.get(
+                "node_executions",
+                [],
+            )
+        ):
+            if (
+                execution["node_name"]
+                == "generate_parser_proposal"
+            ):
+                proposal_output = (
+                    execution["output_state"]
+                )
+                break
+
+        if proposal_output:
+            proposal_columns = st.columns(4)
+
+            proposal_columns[0].metric(
+                "Proposal status",
+                proposal_output.get(
+                    "proposal_status",
+                    "UNKNOWN",
+                ),
+            )
+
+            proposal_columns[1].metric(
+                "Proposal source",
+                proposal_output.get(
+                    "proposal_source",
+                    "UNKNOWN",
+                ),
+            )
+
+            proposal_columns[2].metric(
+                "Execution authorized",
+                str(
+                    proposal_output.get(
+                        "parser_execution_authorized",
+                        False,
+                    )
+                ),
+            )
+
+            validation = (
+                proposal_output.get(
+                    "proposal_validation",
+                    {},
+                )
+                or {}
+            )
+
+            proposal_columns[3].metric(
+                "Mappings",
+                validation.get(
+                    "mapping_count",
+                    0,
+                ),
+            )
+
+            with st.expander(
+                "View pending parser proposal",
+                expanded=True,
+            ):
+                st.json(
+                    proposal_output.get(
+                        "parser_proposal",
+                        {},
+                    )
+                )
+
+            st.caption(
+                "Proposal hash: "
+                + str(
+                    proposal_output.get(
+                        "proposal_hash",
+                        "Unavailable",
+                    )
+                )
+            )
+
+    if (
+        run["status"]
+        == "WAITING_FOR_HUMAN_REVIEW"
+    ):
+        st.warning(
+            "The workflow is paused. "
+            "No parser is executing. "
+            "Human review is required."
+        )
+
+        proposal_output = None
+
+        for execution in reversed(
+            run.get(
+                "node_executions",
+                [],
+            )
+        ):
+            if (
+                execution["node_name"]
+                == "generate_parser_proposal"
+            ):
+                proposal_output = (
+                    execution["output_state"]
+                )
+                break
+
+        if proposal_output:
+            st.markdown(
+                "### Human approval workbench"
+            )
+
+            proposal = (
+                proposal_output.get(
+                    "parser_proposal",
+                    {},
+                )
+            )
+
+            proposal_hash = (
+                proposal_output.get(
+                    "proposal_hash",
+                    "",
+                )
+            )
+
+            st.json(proposal)
+
+            st.session_state.reviewer_id = (
+                st.text_input(
+                    "Reviewer ID",
+                    value=(
+                        st.session_state
+                        .reviewer_id
+                    ),
+                )
+            )
+
+            st.session_state.review_comments = (
+                st.text_area(
+                    "Review comments",
+                    value=(
+                        st.session_state
+                        .review_comments
+                    ),
+                )
+            )
+
+            approve_column, reject_column = (
+                st.columns(2)
+            )
+
+            if approve_column.button(
+                "Approve parser proposal",
+                type="primary",
+                use_container_width=True,
+            ):
+                response = requests.post(
+                    (
+                        f"{API_BASE_URL}"
+                        f"/v1/reviews/{run_id}"
+                    ),
+                    json={
+                        "decision": "APPROVE",
+                        "reviewer_id": (
+                            st.session_state
+                            .reviewer_id
+                        ),
+                        "comments": (
+                            st.session_state
+                            .review_comments
+                        ),
+                        "proposal_hash": (
+                            proposal_hash
+                        ),
+                    },
+                    timeout=60,
+                )
+
+                if response.ok:
+                    st.success(
+                        "Proposal approved and "
+                        "workflow resumed."
+                    )
+                    st.rerun()
+                else:
+                    st.error(response.text)
+
+            if reject_column.button(
+                "Reject parser proposal",
+                use_container_width=True,
+            ):
+                response = requests.post(
+                    (
+                        f"{API_BASE_URL}"
+                        f"/v1/reviews/{run_id}"
+                    ),
+                    json={
+                        "decision": "REJECT",
+                        "reviewer_id": (
+                            st.session_state
+                            .reviewer_id
+                        ),
+                        "comments": (
+                            st.session_state
+                            .review_comments
+                        ),
+                        "proposal_hash": (
+                            proposal_hash
+                        ),
+                    },
+                    timeout=60,
+                )
+
+                if response.ok:
+                    st.warning(
+                        "Proposal rejected."
+                    )
+                    st.rerun()
+                else:
+                    st.error(response.text)
+
+    if run["status"] in {
+        "WORKFLOW_COMPLETED",
+        "WORKFLOW_COMPLETED_WITH_WARNINGS",
+        "OUTPUT_VALIDATION_FAILED",
+    }:
+        validation_output = None
+
+        for execution in reversed(
+            run.get(
+                "node_executions",
+                [],
+            )
+        ):
+            if (
+                execution["node_name"]
+                == "validate_parsed_output"
+            ):
+                validation_output = (
+                    execution["output_state"]
+                )
+                break
+
+        if validation_output:
+            st.markdown(
+                "### Output validation"
+            )
+
+            validation_status = (
+                validation_output.get(
+                    "validation_status",
+                    "UNKNOWN",
+                )
+            )
+
+            if validation_status == "PASS":
+                st.success(
+                    "Parsed output passed "
+                    "deterministic validation."
+                )
+
+            elif validation_status == "WARN":
+                st.warning(
+                    "Parsed output completed with "
+                    "validation warnings."
+                )
+
+            else:
+                st.error(
+                    "Parsed output failed "
+                    "validation."
+                )
+
+            validation_metrics = (
+                validation_output.get(
+                    "validation_metrics",
+                    {},
+                )
+                or {}
+            )
+
+            metric_columns = st.columns(4)
+
+            metric_columns[0].metric(
+                "Validation",
+                validation_status,
+            )
+
+            completeness = validation_metrics.get(
+                "completeness_percentage",
+                0,
+            )
+
+            uniqueness = validation_metrics.get(
+                "uniqueness_percentage",
+                0,
+            )
+
+            metric_columns[1].metric(
+                "Completeness",
+                f"{completeness}%",
+            )
+
+            metric_columns[2].metric(
+                "Uniqueness",
+                f"{uniqueness}%",
+            )
+
+            metric_columns[3].metric(
+                "Duplicates",
+                validation_output.get(
+                    "duplicate_record_count",
+                    0,
+                ),
+            )
+
+            validation_summary = (
+                validation_output.get(
+                    "validation_summary",
+                    {},
+                )
+                or {}
+            )
+
+            st.json(
+                validation_summary
+            )
+
+            validation_issues = (
+                validation_output.get(
+                    "validation_issues",
+                    [],
+                )
+                or []
+            )
+
+            if validation_issues:
+                with st.expander(
+                    "View validation issues",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        validation_issues,
+                        use_container_width=True,
+                    )
+
+    if run["status"] == "FINAL_FILE_READY":
+        final_output = None
+        parsed_output = None
+
+        for execution in reversed(
+            run.get(
+                "node_executions",
+                [],
+            )
+        ):
+            if (
+                final_output is None
+                and execution["node_name"]
+                == "create_validated_xlsx"
+            ):
+                final_output = (
+                    execution["output_state"]
+                )
+
+            if (
+                parsed_output is None
+                and execution["node_name"]
+                == "execute_approved_parser"
+            ):
+                parsed_output = (
+                    execution["output_state"]
+                )
+
+        st.markdown(
+            "### Final validated XLSX"
+        )
+
+        st.success(
+            "The validated Excel file is ready."
+        )
+
+        if final_output:
+            file_columns = st.columns(4)
+
+            file_columns[0].metric(
+                "Rows",
+                final_output.get(
+                    "final_output_row_count",
+                    0,
+                ),
+            )
+
+            file_columns[1].metric(
+                "Columns",
+                final_output.get(
+                    "final_output_column_count",
+                    0,
+                ),
+            )
+
+            output_size = (
+                final_output.get(
+                    "final_output_size_bytes",
+                    0,
+                )
+            )
+
+            file_columns[2].metric(
+                "Size",
+                f"{output_size} bytes",
+            )
+
+            file_columns[3].metric(
+                "Available",
+                str(
+                    final_output.get(
+                        "final_output_available",
+                        False,
+                    )
+                ),
+            )
+
+            st.write(
+                "Filename:",
+                final_output.get(
+                    "final_output_filename",
+                    "Unavailable",
+                ),
+            )
+
+            st.caption(
+                "SHA-256: "
+                + str(
+                    final_output.get(
+                        "final_output_checksum_sha256",
+                        "Unavailable",
+                    )
+                )
+            )
+
+        if parsed_output:
+            parsed_records = (
+                parsed_output.get(
+                    "parsed_records",
+                    [],
+                )
+                or []
+            )
+
+            st.markdown(
+                "#### Validated data preview"
+            )
+
+            if parsed_records:
+                st.dataframe(
+                    parsed_records,
+                    use_container_width=True,
+                )
+            else:
+                st.info(
+                    "The final XLSX contains "
+                    "no data rows."
+                )
+
+        try:
+            download_response = requests.get(
+                (
+                    f"{API_BASE_URL}"
+                    f"/v1/runs/{run_id}/download"
+                ),
+                timeout=30,
+            )
+
+            if download_response.ok:
+                output_filename = (
+                    final_output.get(
+                        "final_output_filename",
+                        (
+                            "validated_output.xlsx"
+                        ),
+                    )
+                    if final_output
+                    else "validated_output.xlsx"
+                )
+
+                st.download_button(
+                    label=(
+                        "Download validated XLSX"
+                    ),
+                    data=(
+                        download_response.content
+                    ),
+                    file_name=(
+                        output_filename
+                    ),
+                    mime=(
+                        "application/vnd."
+                        "openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            else:
+                st.error(
+                    "Validated XLSX download "
+                    "is unavailable."
+                )
+
+        except requests.RequestException as exception:
+            st.error(
+                "Could not retrieve the "
+                "validated XLSX."
+            )
+
+            st.code(str(exception))
+
+    executions = run.get(
+        "node_executions",
+        [],
+    )
+
+
+    render_node_timeline(
+        executions=executions
+    )
+
+    st.markdown("### Processing timeline")
+
+    st.caption(
+        "Click a node to inspect the exact input "
+        "state received by the node and the exact "
+        "output state produced by the node."
+    )
+
+    if not executions:
+        st.info(
+            "No node executions have been "
+            "recorded yet."
+        )
+
+        return
+
+    timeline_columns = st.columns(4)
+
+    for index, execution in enumerate(
+        executions
+    ):
+        icon = STATUS_ICONS.get(
+            execution["status"],
+            "•",
+        )
+
+        button_label = (
+            f"{icon} "
+            f"{execution['sequence_number']}. "
+            f"{execution['node_name']}"
+        )
+
+        clicked = timeline_columns[
+            index % 4
+        ].button(
+            button_label,
+            key=(
+                f"execution_"
+                f"{execution['id']}"
+            ),
+            use_container_width=True,
+        )
+
+        if clicked:
+            st.session_state[
+                "selected_execution_id"
+            ] = execution["id"]
+
+    selected_execution_id = (
+        st.session_state
+        .selected_execution_id
+    )
+
+    selected_execution = next(
+        (
+            execution
+            for execution in executions
+            if execution["id"]
+            == selected_execution_id
+        ),
+        executions[-1],
+    )
+
+    st.markdown(
+        "### Node inspection: "
+        f"`{selected_execution['node_name']}`"
+    )
+
+    detail_columns = st.columns(4)
+
+    detail_columns[0].metric(
+        "Sequence",
+        selected_execution[
+            "sequence_number"
+        ],
+    )
+
+    detail_columns[1].metric(
+        "Status",
+        selected_execution["status"],
+    )
+
+    detail_columns[2].metric(
+        "Guardrail",
+        (
+            selected_execution[
+                "guardrail_name"
+            ]
+            or "None"
+        ),
+    )
+
+    detail_columns[3].metric(
+        "Execution ID",
+        selected_execution["id"],
+    )
+
+    if selected_execution["status"] in {
+        "BLOCKED",
+        "FAILED",
+    }:
+        st.error(
+            selected_execution[
+                "public_message"
+            ]
+        )
+    else:
+        st.info(
+            selected_execution[
+                "public_message"
+            ]
+        )
+
+    input_column, output_column = (
+        st.columns(2)
+    )
+
+    with input_column:
+        st.markdown("#### Input state")
+
+        st.caption(
+            "State available when the "
+            "node started"
+        )
+
+        st.json(
+            selected_execution[
+                "input_state"
+            ]
+        )
+
+    with output_column:
+        st.markdown("#### Output state")
+
+        st.caption(
+            "State update produced by "
+            "the node"
+        )
+
+        st.json(
+            selected_execution[
+                "output_state"
+            ]
+        )
+
+
+render_run_status()
